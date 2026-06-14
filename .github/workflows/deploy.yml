@@ -13,15 +13,20 @@ jobs:
   deploy:
     name: Deploy via SSH (shared hosting)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Deploy on server
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          GITHUB_DEPLOY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           host: ${{ secrets.PROD_HOST }}
           username: ${{ secrets.PROD_USER }}
           key: ${{ secrets.PROD_SSH_KEY }}
           port: ${{ secrets.PROD_PORT || 22 }}
+          envs: GITHUB_DEPLOY_TOKEN
           script_stop: true
           script: |
             set -euo pipefail

@@ -9,7 +9,11 @@ NPM_BIN="${NPM_BIN:-npm}"
 cd "$DEPLOY_PATH"
 
 echo "==> Обновление кода..."
-git fetch origin main
+if [ -n "${GITHUB_DEPLOY_TOKEN:-}" ]; then
+  git -c "http.extraHeader=Authorization: Bearer ${GITHUB_DEPLOY_TOKEN}" fetch origin main
+else
+  git fetch origin main
+fi
 git reset --hard origin/main
 
 # shellcheck source=lib/php-bin.sh

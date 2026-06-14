@@ -28,3 +28,6 @@ php artisan migrate --seed
 | Email | Пароль |
 |-------|--------|
 | demo@example.com | password |
+
+## Как происходит парсинг
+
