@@ -13,20 +13,64 @@ jobs:
   deploy:
     name: Deploy via SSH (shared hosting)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
-      - name: Deploy on server
-        uses: appleboy/ssh-action@v1.2.0
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+          cp dist/index.html ../backend/public/index.html
+          rm -rf ../backend/public/assets
+          cp -r dist/assets ../backend/public/assets
+          if [ -f dist/favicon.svg ]; then
+            cp dist/favicon.svg ../backend/public/favicon.svg
+          fi
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H -p "${{ secrets.PROD_PORT || 22 }}" "${{ secrets.PROD_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Sync files to server
         env:
-          GITHUB_DEPLOY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          PROD_PORT: ${{ secrets.PROD_PORT }}
+          PROD_PATH: ${{ secrets.PROD_PATH }}
+        run: |
+          PORT="${PROD_PORT:-22}"
+          rsync -avz --delete \
+            --exclude '.git/' \
+            --exclude 'backend/.env' \
+            --exclude 'backend/database/database.sqlite' \
+            --exclude 'backend/storage/logs/' \
+            --exclude 'backend/storage/framework/cache/data/' \
+            --exclude 'backend/storage/framework/sessions/' \
+            --exclude 'backend/storage/framework/views/' \
+            --exclude 'backend/vendor/' \
+            --exclude 'deploy.env' \
+            --exclude 'frontend/node_modules/' \
+            -e "ssh -i ~/.ssh/deploy_key -p ${PORT} -o StrictHostKeyChecking=accept-new" \
+            ./ "${PROD_USER}@${PROD_HOST}:${PROD_PATH}/"
+
+      - name: Install and migrate on server
+        uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.PROD_HOST }}
           username: ${{ secrets.PROD_USER }}
           key: ${{ secrets.PROD_SSH_KEY }}
           port: ${{ secrets.PROD_PORT || 22 }}
-          envs: GITHUB_DEPLOY_TOKEN
           script_stop: true
           script: |
             set -euo pipefail
@@ -36,4 +80,4 @@ jobs:
               source deploy.env
             fi
             export PHP_BIN="${PHP_BIN:-/opt/php/8.3/bin/php}"
-            bash scripts/deploy.sh
+            bash scripts/deploy-remote.sh
