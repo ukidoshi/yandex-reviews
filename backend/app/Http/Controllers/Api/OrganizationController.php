@@ -23,10 +23,14 @@ class OrganizationController extends Controller
     public function store(Request $request, OrganizationService $organizations): JsonResponse
     {
         $validated = $request->validate([
-            'url' => ['required', 'url', 'regex:/yandex\.(ru|com)\/maps/'],
+            'url' => ['required', 'string', 'max:2000', 'url', 'regex:/yandex\.(ru|com)\/maps/i'],
+        ], [
+            'url.required' => 'Укажите ссылку на организацию.',
+            'url.url' => 'Ссылка должна начинаться с http:// или https://.',
+            'url.regex' => 'Нужна ссылка на Яндекс Карты.',
         ]);
 
-        $organization = $organizations->import($request->user(), $validated['url']);
+        $organization = $organizations->import($request->user(), trim($validated['url']));
 
         return response()->json(['organization' => $organization], 201);
     }

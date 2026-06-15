@@ -5,20 +5,22 @@ namespace App\Services;
 use App\Models\Organization;
 use App\Models\User;
 use GuzzleHttp\Cookie\CookieJar;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Validation\ValidationException;
-use InvalidArgumentException;
-use RuntimeException;
 
 class OrganizationService
 {
     private const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-    private const MAX_PAGES = 14; // 14 × 50 = 700, больше API не отдаёт
+    private const MAX_PAGES = 14;
+
+    private const TIMEOUT = 25;
 
     public function import(User $user, string $url): Organization
     {
+        $url = trim($url);
         $data = $this->fetchFromYandex($url);
 
         $exists = Organization::query()
@@ -27,9 +29,7 @@ class OrganizationService
             ->exists();
 
         if ($exists) {
-            throw ValidationException::withMessages([
-                'url' => ['Эта организация уже добавлена.'],
-            ]);
+            $this->fail('Эта организация уже добавлена.');
         }
 
         return $this->save($user, $url, $data);
@@ -91,7 +91,7 @@ class OrganizationService
 
             if ($response === null) {
                 if ($page === 1 && $session['meta']['reviews_count'] > 0) {
-                    throw new RuntimeException('Яндекс API не вернул отзывы.');
+                    $this->fail('Яндекс не отдал отзывы. Попробуйте позже.');
                 }
 
                 break;
@@ -126,35 +126,61 @@ class OrganizationService
             return $matches[1];
         }
 
-        $decodedUrl = urldecode(html_entity_decode($url));
+        $decoded = urldecode(html_entity_decode($url));
 
-        if (preg_match('#oid=(\d+)#', $decodedUrl, $matches)) {
+        if (preg_match('#oid=(\d+)#', $decoded, $matches)) {
             return $matches[1];
         }
 
-        throw new InvalidArgumentException('Не удалось извлечь ID организации из ссылки Яндекс Карт.');
+        $this->fail('Не удалось определить организацию. Нужна ссылка на карточку в Яндекс Картах.');
     }
 
     private function initSession(string $orgId, CookieJar $cookieJar): array
     {
         $reviewsUrl = sprintf('https://yandex.ru/maps/org/%s/reviews/', $orgId);
 
-        $response = $this->httpClient($cookieJar, $reviewsUrl)->get($reviewsUrl);
+        try {
+            $response = $this->httpClient($cookieJar, $reviewsUrl)->get($reviewsUrl);
+        } catch (ConnectionException) {
+            $this->fail('Яндекс Карты не отвечают. Проверьте ссылку и попробуйте позже.');
+        }
+
+        if ($response->status() === 404) {
+            $this->fail('Организация не найдена на Яндекс Картах.');
+        }
 
         if (! $response->successful()) {
-            throw new RuntimeException('Не удалось загрузить страницу организации на Яндекс Картах.');
+            $this->fail('Страница организации недоступна (код '.$response->status().').');
+        }
+
+        $body = $response->body();
+
+        if ($body === '') {
+            $this->fail('Яндекс вернул пустую страницу.');
         }
 
         $reviewsUrl = (string) $response->effectiveUri();
-        $state = $this->extractPageState($response->body());
+        $state = $this->extractPageState($body);
+        $item = $state['stack'][0]['results']['items'][0] ?? null;
 
-        $item = $state['stack'][0]['results']['items'][0] ?? [];
+        if ($item === null) {
+            $this->fail('На странице нет данных об организации. Проверьте ссылку.');
+        }
+
+        $csrf = $state['config']['csrfToken'] ?? null;
+        $sessionId = $state['config']['counters']['analytics']['sessionId'] ?? null;
+        $reqId = $state['stack'][0]['results']['requestId'] ?? null;
+
+        if (! $csrf || ! $sessionId || ! $reqId) {
+            $this->fail('Яндекс изменил формат страницы — парсер нужно обновить.');
+        }
+
         $ratingData = $item['ratingData'] ?? [];
 
         return [
-            'csrf_token' => $state['config']['csrfToken'] ?? null,
-            'session_id' => $state['config']['counters']['analytics']['sessionId'] ?? null,
-            'req_id' => $state['stack'][0]['results']['requestId'] ?? null,
+            'csrf_token' => $csrf,
+            'session_id' => $sessionId,
+            'req_id' => $reqId,
             'reviews_url' => $reviewsUrl,
             'meta' => [
                 'name' => $item['title'] ?? null,
@@ -198,19 +224,38 @@ class OrganizationService
     {
         $query['s'] = $this->signRequest($query);
 
-        $response = $this->httpClient($cookieJar, $reviewUrl)
-            ->get('https://yandex.ru/maps/api/business/fetchReviews', $query);
-
-        if (! $response->successful()) {
-            throw new RuntimeException('Ошибка запроса к API отзывов Яндекс Карт.');
+        try {
+            $response = $this->httpClient($cookieJar, $reviewUrl)
+                ->get('https://yandex.ru/maps/api/business/fetchReviews', $query);
+        } catch (ConnectionException) {
+            $this->fail('Потеряно соединение с Яндекс Картами при загрузке отзывов.');
         }
 
-        return $response->json() ?? [];
+        if ($response->status() === 429) {
+            $this->fail('Яндекс временно ограничил запросы. Попробуйте через несколько минут.');
+        }
+
+        if (! $response->successful()) {
+            $this->fail('API отзывов вернул ошибку (код '.$response->status().').');
+        }
+
+        if ($response->body() === '') {
+            return [];
+        }
+
+        $json = $response->json();
+
+        if (! is_array($json)) {
+            $this->fail('API отзывов вернул не JSON.');
+        }
+
+        return $json;
     }
 
     private function httpClient(CookieJar $cookieJar, string $reviewUrl)
     {
-        return Http::withOptions(['cookies' => $cookieJar])
+        return Http::timeout(self::TIMEOUT)
+            ->withOptions(['cookies' => $cookieJar])
             ->withHeaders([
                 'User-Agent' => self::USER_AGENT,
                 'Accept' => 'application/json, text/plain, */*',
@@ -219,6 +264,21 @@ class OrganizationService
                 'Origin' => 'https://yandex.ru',
                 'X-Requested-With' => 'XMLHttpRequest',
             ]);
+    }
+
+    private function extractPageState(string $html): array
+    {
+        if (! preg_match('/<script[^>]*type="application\/json"[^>]*>(.*?)<\/script>/s', $html, $matches)) {
+            $this->fail('Не найден JSON на странице — возможно, Яндекс изменил вёрстку.');
+        }
+
+        $state = json_decode($matches[1], true);
+
+        if (! is_array($state)) {
+            $this->fail('JSON на странице повреждён или пустой.');
+        }
+
+        return $state;
     }
 
     private function signRequest(array $query): string
@@ -252,21 +312,6 @@ class OrganizationService
         return $hash;
     }
 
-    private function extractPageState(string $html): array
-    {
-        if (! preg_match('/<script[^>]*type="application\/json"[^>]*>(.*?)<\/script>/s', $html, $matches)) {
-            throw new InvalidArgumentException('Не удалось прочитать состояние страницы Яндекс Карт.');
-        }
-
-        $state = json_decode($matches[1], true);
-
-        if (! is_array($state)) {
-            throw new InvalidArgumentException('Некорректное состояние страницы Яндекс Карт.');
-        }
-
-        return $state;
-    }
-
     private function normalizeReview(array $review): array
     {
         $author = $review['author'] ?? [];
@@ -278,5 +323,10 @@ class OrganizationService
             'rating' => $review['rating'] ?? null,
             'date' => $review['updatedTime'] ?? null,
         ];
+    }
+
+    private function fail(string $message): never
+    {
+        throw ValidationException::withMessages(['url' => [$message]]);
     }
 }
