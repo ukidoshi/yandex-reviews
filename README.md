@@ -2,6 +2,8 @@
 
 Скелет: **Laravel API + Vue 3 SPA** с входом через Sanctum.
 
+Рабочий стенд: https://test.ukidoshi.store/
+
 ## Стек
 
 - Laravel 13 + Sanctum (cookie-based SPA auth)
